@@ -247,6 +247,9 @@ Write-Host ""
 Write-Host "Watching $WatchFolder for $($FileTypes -join ' ')...Press CTRL+C to stop."
 Write-Host ""
 
+$FirstPass    = $true
+$LastDeferred = 0
+
 
 # --- collect -------------------------------------------------------------
 
@@ -256,13 +259,22 @@ while ($true) {
         $since     = $Cursor.AddSeconds(-$OverlapSeconds)
         $deferred  = @()
 
-        $files = @(foreach ($type in $FileTypes) {
+        $matched = @(foreach ($type in $FileTypes) {
             Get-ChildItem -LiteralPath $WatchFolder -Filter $type -Recurse -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -like $type -and $_.LastWriteTimeUtc -gt $since }
-        }) | Sort-Object FullName -Unique | Sort-Object LastWriteTimeUtc
+                Where-Object { $_.Name -like $type }
+        }) | Sort-Object FullName -Unique
+        $files = @($matched | Where-Object { $_.LastWriteTimeUtc -gt $since }) | Sort-Object LastWriteTimeUtc
+
+        # One summary on the first pass, so a folder that yields nothing says why.
+        if ($FirstPass) {
+            Write-Host ("  {0} file(s) match {1}, {2} newer than {3}" -f
+                @($matched).Count, ($FileTypes -join ' '), @($files).Count,
+                $since.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))
+            $FirstPass = $false
+        }
 
         foreach ($file in $files) {
-            if (Test-Locked $file) { $deferred += $file.LastWriteTimeUtc; continue }
+            if (Test-Locked $file) { $deferred += $file.LastWriteTimeUtc; continue }   # reported below
 
             $name        = Get-TargetName $file
             $destination = Get-Destination $file.FullName
@@ -287,6 +299,13 @@ while ($true) {
                 Write-Host ("  FAILED {0} - {1}" -f $file.Name, $_.Exception.Message)
                 Write-LogLine 'FAILED' $file.FullName $_.Exception.Message
             }
+        }
+
+        # Files in use are retried next pass. Say so, but only when it changes,
+        # or a stuck file would print every few seconds forever.
+        if (@($deferred).Count -ne $LastDeferred) {
+            if ($deferred) { Write-Host ("  {0} file(s) in use, will retry" -f @($deferred).Count) }
+            $LastDeferred = @($deferred).Count
         }
 
         # Never step the cursor past a file this pass could not move.
