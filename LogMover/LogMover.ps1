@@ -41,20 +41,51 @@ function Get-Setting($ini, $section, $key, $default) {
     return $default
 }
 
-function Save-WatchFolder($path, $folder) {
-    $out = New-Object System.Collections.Generic.List[string]
-    $inGeneral = $false
-    $written   = $false
-    foreach ($line in (Get-Content -LiteralPath $path)) {
-        if ($line -match '^\s*\[(.+)\]\s*$') { $inGeneral = ($Matches[1].Trim() -eq 'General') }
-        if ($inGeneral -and -not $written -and $line -match '^\s*WatchFolder\s*=') {
-            $out.Add("WatchFolder         = $folder")
+function Save-Setting($path, $section, $key, $value) {
+    $line    = '{0,-19} = {1}' -f $key, $value
+    $out     = New-Object System.Collections.Generic.List[string]
+    $current = ''
+    $written = $false
+    foreach ($text in (Get-Content -LiteralPath $path)) {
+        if ($text -match '^\s*\[(.+)\]\s*$') {
+            # Leaving the section without having found the key - add it here.
+            if ($current -eq $section -and -not $written) { $out.Add($line); $written = $true }
+            $current = $Matches[1].Trim()
+        }
+        if ($current -eq $section -and -not $written -and $text -match "^\s*$key\s*=") {
+            $out.Add($line)
             $written = $true
             continue
         }
+        $out.Add($text)
+    }
+    if (-not $written) {
+        if ($current -ne $section) { $out.Add(''); $out.Add("[$section]") }
         $out.Add($line)
     }
     Set-Content -LiteralPath $path -Value $out -Encoding UTF8
+}
+
+function Read-Folder {
+    param($Label, $Current, [switch]$MustExist, [switch]$AllowNone)
+    while ($true) {
+        $prompt = if ($Current)   { "$Label [$Current]" }
+                  elseif ($AllowNone) { "$Label (Enter for none)" }
+                  else               { $Label }
+        $answer = Read-Host $prompt
+        if ($answer -eq '') { $answer = $Current }
+        if ($answer -eq '') {
+            if ($AllowNone) { return '' }
+            Write-Host "  A folder is needed."
+            continue
+        }
+        $answer = $answer.Trim().Trim('"').TrimEnd('\')
+        if ($MustExist -and -not (Test-Path -LiteralPath $answer)) {
+            Write-Host "  Cannot reach $answer"
+            continue
+        }
+        return $answer
+    }
 }
 
 
@@ -146,27 +177,28 @@ $Exceptions   = if ($Config.Contains('Exceptions')) { $Config['Exceptions'] } el
 $LogPath = Get-Setting $Config General LogFile ''
 if ($LogPath -and -not [IO.Path]::IsPathRooted($LogPath)) { $LogPath = Join-Path $ScriptDir $LogPath }
 
-if (-not $DefaultDest) {
-    Write-Host "LogMover.config.ini has no [Destination] Default folder."
-    exit 1
-}
 
-
-# --- watch folder --------------------------------------------------------
+# --- folders -------------------------------------------------------------
+# The watch folder is always offered so it can be changed per run. The other
+# folders are only asked for when the config leaves them blank. Whatever is
+# entered is written back, so each is asked at most once.
 
 Write-Host "LogMover is running...Press CTRL+C to stop."
 Write-Host ""
 
-$Remembered = Get-Setting $Config General WatchFolder ''
-while ($true) {
-    $answer = Read-Host $(if ($Remembered) { "Watch folder [$Remembered]" } else { "Watch folder" })
-    if ($answer -eq '') { $answer = $Remembered }
-    if ($answer -eq '') { Write-Host "  A watch folder is needed."; continue }
-    if (-not (Test-Path -LiteralPath $answer)) { Write-Host "  Cannot reach $answer"; continue }
-    $WatchFolder = (Get-Item -LiteralPath $answer).FullName.TrimEnd('\')
-    break
+$Remembered  = Get-Setting $Config General WatchFolder ''
+$WatchFolder = (Get-Item -LiteralPath (Read-Folder 'Watch folder' $Remembered -MustExist)).FullName.TrimEnd('\')
+if ($WatchFolder -ne $Remembered) { Save-Setting $ConfigPath 'General' 'WatchFolder' $WatchFolder }
+
+if (-not $DefaultDest) {
+    $DefaultDest = Read-Folder 'Destination folder' ''
+    Save-Setting $ConfigPath 'Destination' 'Default' $DefaultDest
 }
-if ($WatchFolder -ne $Remembered) { Save-WatchFolder $ConfigPath $WatchFolder }
+
+if (-not $BackupFolder) {
+    $BackupFolder = Read-Folder 'Backup folder' '' -AllowNone
+    if ($BackupFolder) { Save-Setting $ConfigPath 'General' 'BackupFolder' $BackupFolder }
+}
 
 $Cursor = Get-Cursor $WatchFolder
 if (-not $Cursor) { $Cursor = (Get-Date).ToUniversalTime().AddDays(-$LookbackDays) }
