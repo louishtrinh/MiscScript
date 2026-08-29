@@ -130,8 +130,14 @@ function Get-Destination($fullPath) {
 }
 
 function Get-TargetName($file) {
-    if ($RenameFrom -and $file.Extension -ieq $RenameFrom) {
-        return [IO.Path]::GetFileNameWithoutExtension($file.Name) + $RenameTo
+    foreach ($from in $Renames.Keys) {
+        # A leading dot is optional in the config, so .atd and atd both work.
+        $ext = if ($from.StartsWith('.')) { $from } else { ".$from" }
+        if ($file.Extension -ieq $ext) {
+            $to = $Renames[$from]
+            if (-not $to.StartsWith('.')) { $to = ".$to" }
+            return [IO.Path]::GetFileNameWithoutExtension($file.Name) + $to
+        }
     }
     return $file.Name
 }
@@ -176,8 +182,7 @@ $FileTypes = @((Get-Setting $Config General FileTypes '*.*') -split ';' |
                ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $PollSeconds  = [int](Get-Setting $Config General PollSeconds 5)
 $LookbackDays = [int](Get-Setting $Config General InitialLookbackDays 1)
-$RenameFrom   = Get-Setting $Config Rename From ''
-$RenameTo     = Get-Setting $Config Rename To ''
+$Renames      = if ($Config.Contains('Rename')) { $Config['Rename'] } else { [ordered]@{} }
 $DefaultDest  = Get-Setting $Config Destination Default ''
 $Exceptions   = if ($Config.Contains('Exceptions')) { $Config['Exceptions'] } else { [ordered]@{} }
 
