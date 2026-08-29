@@ -146,14 +146,23 @@ function Get-TargetName($file) {
     return $file.Name
 }
 
-function Get-FreePath($folder, $name) {
-    $target = Join-Path $folder $name
-    if (-not (Test-Path -LiteralPath $target)) { return $target }
+function Get-CopyTarget($folder, $name, $file) {
+    # Returns where to copy, or $null when this exact file is already there.
+    # Source files are never deleted, so every pass sees them again - without
+    # this the overlap window alone would pile up _2, _3, _4 copies.
     $base = [IO.Path]::GetFileNameWithoutExtension($name)
     $ext  = [IO.Path]::GetExtension($name)
-    $n = 2
-    while (Test-Path -LiteralPath ($target = Join-Path $folder ('{0}_{1}{2}' -f $base, $n, $ext))) { $n++ }
-    return $target
+    $n = 1
+    while ($true) {
+        $candidate = if ($n -eq 1) { Join-Path $folder $name }
+                     else { Join-Path $folder ('{0}_{1}{2}' -f $base, $n, $ext) }
+        if (-not (Test-Path -LiteralPath $candidate)) { return $candidate }
+        $existing = Get-Item -LiteralPath $candidate
+        # Copy-Item preserves the write time, so size plus time identifies a copy.
+        if ($existing.Length -eq $file.Length -and
+            $existing.LastWriteTimeUtc -eq $file.LastWriteTimeUtc) { return $null }
+        $n++
+    }
 }
 
 function Test-Locked($file) {
@@ -253,6 +262,7 @@ Write-Host ""
 
 $FirstPass    = $true
 $LastDeferred = 0
+$LastSkipped  = 0
 
 
 # --- collect -------------------------------------------------------------
@@ -262,6 +272,7 @@ while ($true) {
         $scanStart = (Get-Date).ToUniversalTime()
         $since     = $Cursor.AddSeconds(-$OverlapSeconds)
         $deferred  = @()
+        $skipped   = 0
 
         $matched = @(foreach ($type in $FileTypes) {
             Get-ChildItem -LiteralPath $WatchFolder -Filter $type -Recurse -File -ErrorAction SilentlyContinue |
@@ -286,17 +297,18 @@ while ($true) {
             $target      = $null
             try {
                 New-Item -ItemType Directory -Path $destination -Force | Out-Null
-                $target = Get-FreePath $destination $name
+                $target = Get-CopyTarget $destination $name $file
+                if (-not $target) { $skipped++; continue }
+
                 Copy-Item -LiteralPath $file.FullName -Destination $target
                 if ((Get-Item -LiteralPath $target).Length -ne $file.Length) {
                     throw "copy landed short at $target"
                 }
-                Remove-Item -LiteralPath $file.FullName -Force
 
                 # Naming the rule makes a wrong exception obvious on the first file.
                 Write-Host ("  {0} -> {1}{2}" -f $file.Name, (Split-Path -Leaf $destination),
                     $(if ($route.Rule) { " (rule $($route.Rule))" } else { "" }))
-                Write-LogLine 'MOVED' $file.FullName $target
+                Write-LogLine 'COPIED' $file.FullName $target
             }
             catch {
                 if ($target -and (Test-Path -LiteralPath $target)) {
@@ -306,6 +318,11 @@ while ($true) {
                 Write-Host ("  FAILED {0} - {1}" -f $file.Name, $_.Exception.Message)
                 Write-LogLine 'FAILED' $file.FullName $_.Exception.Message
             }
+        }
+
+        if ($skipped -ne $LastSkipped) {
+            if ($skipped) { Write-Host ("  {0} file(s) already at the destination" -f $skipped) }
+            $LastSkipped = $skipped
         }
 
         # Files in use are retried next pass. Say so, but only when it changes,
