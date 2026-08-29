@@ -67,15 +67,11 @@ function Save-Setting($path, $section, $key, $value) {
 }
 
 function Read-Folder {
-    param($Label, $Current, [switch]$MustExist, [switch]$AllowNone)
+    param($Label, $Current, [switch]$MustExist)
     while ($true) {
-        $prompt = if ($Current)   { "$Label [$Current]" }
-                  elseif ($AllowNone) { "$Label (Enter for none)" }
-                  else               { $Label }
-        $answer = Read-Host $prompt
+        $answer = Read-Host $(if ($Current) { "$Label [$Current]" } else { $Label })
         if ($answer -eq '') { $answer = $Current }
         if ($answer -eq '') {
-            if ($AllowNone) { return '' }
             Write-Host "  A folder is needed."
             continue
         }
@@ -88,6 +84,16 @@ function Read-Folder {
     }
 }
 
+
+function Read-Cursor($current) {
+    $shown = $current.ToLocalTime().ToString('yyyy-MM-dd HH:mm')
+    while ($true) {
+        $answer = (Read-Host "Collect files newer than [$shown]").Trim()
+        if ($answer -eq '') { return $current }
+        try { return ([datetime]::Parse($answer)).ToUniversalTime() }
+        catch { Write-Host "  Cannot read that. Try 2026-08-26 06:00 or 8/26/2026" }
+    }
+}
 
 function Get-StateKey($folder) { return $folder.TrimEnd('\').ToLowerInvariant() }
 
@@ -104,8 +110,10 @@ function Set-Cursor($folder, $utc) {
     $key = Get-StateKey $folder
     $entries = @()
     if (Test-Path -LiteralPath $StatePath) {
-        $entries = @(Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json) |
-                   Where-Object { $_.Folder -ne $key }
+        # The @() must wrap the filter too, or a single surviving entry comes
+        # back as a bare object and += fails.
+        $entries = @(Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json |
+                     Where-Object { $_.Folder -ne $key })
     }
     $entries += [pscustomobject]@{ Folder = $key; LastRun = $utc.ToString('o') }
     Set-Content -LiteralPath $StatePath -Value (@($entries) | ConvertTo-Json) -Encoding UTF8
@@ -168,7 +176,6 @@ $FileTypes = @((Get-Setting $Config General FileTypes '*.*') -split ';' |
                ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 $PollSeconds  = [int](Get-Setting $Config General PollSeconds 5)
 $LookbackDays = [int](Get-Setting $Config General InitialLookbackDays 1)
-$BackupFolder = Get-Setting $Config General BackupFolder ''
 $RenameFrom   = Get-Setting $Config Rename From ''
 $RenameTo     = Get-Setting $Config Rename To ''
 $DefaultDest  = Get-Setting $Config Destination Default ''
@@ -178,33 +185,61 @@ $LogPath = Get-Setting $Config General LogFile ''
 if ($LogPath -and -not [IO.Path]::IsPathRooted($LogPath)) { $LogPath = Join-Path $ScriptDir $LogPath }
 
 
-# --- folders -------------------------------------------------------------
-# The watch folder is always offered so it can be changed per run. The other
-# folders are only asked for when the config leaves them blank. Whatever is
-# entered is written back, so each is asked at most once.
+# --- menu ----------------------------------------------------------------
+# A folder the config leaves blank is asked for once, then the menu takes
+# over. Pressing Enter at the menu runs the collection.
 
-Write-Host "LogMover is running...Press CTRL+C to stop."
-Write-Host ""
-
-$Remembered  = Get-Setting $Config General WatchFolder ''
-$WatchFolder = (Get-Item -LiteralPath (Read-Folder 'Watch folder' $Remembered -MustExist)).FullName.TrimEnd('\')
-if ($WatchFolder -ne $Remembered) { Save-Setting $ConfigPath 'General' 'WatchFolder' $WatchFolder }
-
+$WatchFolder = Get-Setting $Config General WatchFolder ''
+if (-not $WatchFolder) {
+    $WatchFolder = Read-Folder 'Watch folder' '' -MustExist
+    Save-Setting $ConfigPath 'General' 'WatchFolder' $WatchFolder
+}
 if (-not $DefaultDest) {
     $DefaultDest = Read-Folder 'Destination folder' ''
     Save-Setting $ConfigPath 'Destination' 'Default' $DefaultDest
 }
 
-if (-not $BackupFolder) {
-    $BackupFolder = Read-Folder 'Backup folder' '' -AllowNone
-    if ($BackupFolder) { Save-Setting $ConfigPath 'General' 'BackupFolder' $BackupFolder }
-}
-
 $Cursor = Get-Cursor $WatchFolder
 if (-not $Cursor) { $Cursor = (Get-Date).ToUniversalTime().AddDays(-$LookbackDays) }
 
+$Run = $false
+while ($true) {
+    Write-Host ""
+    Write-Host "LogMover"
+    Write-Host ""
+    Write-Host "  1  Run"
+    Write-Host "  2  Watch folder       $WatchFolder"
+    Write-Host "  3  Destination        $DefaultDest"
+    Write-Host ("  4  Last collected     {0}" -f $Cursor.ToLocalTime().ToString('yyyy-MM-dd HH:mm'))
+    Write-Host ""
+
+    switch ((Read-Host "Choice [1]").Trim()) {
+        { $_ -eq '' -or $_ -eq '1' } { $Run = $true }
+        '2' {
+            $picked = Read-Folder 'Watch folder' $WatchFolder -MustExist
+            if ($picked -ne $WatchFolder) {
+                $WatchFolder = (Get-Item -LiteralPath $picked).FullName.TrimEnd('\')
+                Save-Setting $ConfigPath 'General' 'WatchFolder' $WatchFolder
+                # Each watch folder carries its own last-collected time.
+                $Cursor = Get-Cursor $WatchFolder
+                if (-not $Cursor) { $Cursor = (Get-Date).ToUniversalTime().AddDays(-$LookbackDays) }
+            }
+        }
+        '3' {
+            $DefaultDest = Read-Folder 'Destination folder' $DefaultDest
+            Save-Setting $ConfigPath 'Destination' 'Default' $DefaultDest
+        }
+        '4' {
+            $Cursor = Read-Cursor $Cursor
+            Set-Cursor $WatchFolder $Cursor
+        }
+        default { Write-Host "  Pick 1, 2, 3 or 4." }
+    }
+    if ($Run) { break }
+}
+
 Write-Host ""
-Write-Host "Watching $WatchFolder for $($FileTypes -join ' ')"
+Write-Host "Watching $WatchFolder for $($FileTypes -join ' ')...Press CTRL+C to stop."
 Write-Host ""
 
 
@@ -228,13 +263,6 @@ while ($true) {
             $destination = Get-Destination $file.FullName
             $target      = $null
             try {
-                if ($BackupFolder) {
-                    $relative  = $file.DirectoryName.Substring($WatchFolder.Length).TrimStart([IO.Path]::DirectorySeparatorChar)
-                    $backupDir = if ($relative) { Join-Path $BackupFolder $relative } else { $BackupFolder }
-                    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-                    Copy-Item -LiteralPath $file.FullName -Destination (Get-FreePath $backupDir $name)
-                }
-
                 New-Item -ItemType Directory -Path $destination -Force | Out-Null
                 $target = Get-FreePath $destination $name
                 Copy-Item -LiteralPath $file.FullName -Destination $target
