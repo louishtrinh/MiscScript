@@ -120,13 +120,17 @@ function Set-Cursor($folder, $utc) {
 }
 
 
-function Get-Destination($fullPath) {
+function Get-Destination($file) {
+    # Only the part below the watch folder is searched. The watch folder itself
+    # is identical for every file, so a string that appears in it - TES inside
+    # TEST-LOGS, say - would route the whole tree to one exception.
+    $relative = $file.FullName.Substring($WatchFolder.Length)
     foreach ($match in $Exceptions.Keys) {
-        if ($fullPath.IndexOf($match, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-            return $Exceptions[$match]
+        if ($relative.IndexOf($match, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            return [pscustomobject]@{ Folder = $Exceptions[$match]; Rule = $match }
         }
     }
-    return $DefaultDest
+    return [pscustomobject]@{ Folder = $DefaultDest; Rule = '' }
 }
 
 function Get-TargetName($file) {
@@ -277,7 +281,8 @@ while ($true) {
             if (Test-Locked $file) { $deferred += $file.LastWriteTimeUtc; continue }   # reported below
 
             $name        = Get-TargetName $file
-            $destination = Get-Destination $file.FullName
+            $route       = Get-Destination $file
+            $destination = $route.Folder
             $target      = $null
             try {
                 New-Item -ItemType Directory -Path $destination -Force | Out-Null
@@ -288,7 +293,9 @@ while ($true) {
                 }
                 Remove-Item -LiteralPath $file.FullName -Force
 
-                Write-Host ("  {0} -> {1}" -f $file.Name, (Split-Path -Leaf $destination))
+                # Naming the rule makes a wrong exception obvious on the first file.
+                Write-Host ("  {0} -> {1}{2}" -f $file.Name, (Split-Path -Leaf $destination),
+                    $(if ($route.Rule) { " (rule $($route.Rule))" } else { "" }))
                 Write-LogLine 'MOVED' $file.FullName $target
             }
             catch {
